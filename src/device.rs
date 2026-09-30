@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -117,6 +117,227 @@ pub struct UsbmuxDeviceEntry {
 }
 
 
+
+static LEGACY_ENUM_DEVICES: OnceLock<Mutex<Vec<DeviceInfo>>> = OnceLock::new();
+static LEGACY_FIND_TARGET: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LEGACY_FIND_RESULT: OnceLock<Mutex<Option<(usize, String)>>> = OnceLock::new();
+
+fn legacy_enum_devices() -> &'static Mutex<Vec<DeviceInfo>> {
+    LEGACY_ENUM_DEVICES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn legacy_find_target() -> &'static Mutex<Option<String>> {
+    LEGACY_FIND_TARGET.get_or_init(|| Mutex::new(None))
+}
+
+fn legacy_find_result() -> &'static Mutex<Option<(usize, String)>> {
+    LEGACY_FIND_RESULT.get_or_init(|| Mutex::new(None))
+}
+
+extern "C" fn legacy_enumerate_notification_device(
+    info: *const AMDeviceNotificationCallbackInfo,
+) {
+    if info.is_null() {
+        return;
+    }
+    let info = unsafe { &*info };
+    if info.device.is_null() || info.message != 1 {
+        return;
+    }
+
+    let Ok(libs) = get_apple_libraries() else {
+        return;
+    };
+
+    let identifier = unsafe { (libs.am_device_copy_device_identifier)(info.device) };
+    if identifier.is_null() {
+        return;
+    }
+    let udid = libs.to_rust_string(identifier);
+    unsafe { (libs.cf_release)(identifier) };
+    if udid.is_empty() {
+        return;
+    }
+
+    if legacy_enum_devices()
+        .lock()
+        .ok()
+        .is_some_and(|devices| devices.iter().any(|d| d.udid.eq_ignore_ascii_case(&udid)))
+    {
+        return;
+    }
+
+    let mut device_info = DeviceInfo {
+        udid,
+        name: "iPhone".to_string(),
+        product_type: "iPhone".to_string(),
+        ios_version: "Unknown".to_string(),
+        build_version: "Unknown".to_string(),
+        transports: vec![DeviceTransport::Usb],
+    };
+
+    unsafe {
+        if (libs.am_device_connect)(info.device) == 0 {
+            if (libs.am_device_is_paired)(info.device) == 0 {
+                let _ = (libs.am_device_pair)(info.device);
+            }
+
+            let mut pairing_status = (libs.am_device_validate_pairing)(info.device);
+            if pairing_status != 0 {
+                let _ = (libs.am_device_pair)(info.device);
+                pairing_status = (libs.am_device_validate_pairing)(info.device);
+            }
+
+            if pairing_status == 0 && (libs.am_device_start_session)(info.device) == 0 {
+                device_info.name =
+                    read_device_string(&libs, info.device, "DeviceName", "iPhone");
+                device_info.product_type =
+                    read_device_string(&libs, info.device, "ProductType", "iPhone");
+                device_info.ios_version =
+                    read_device_string(&libs, info.device, "ProductVersion", "Unknown");
+                device_info.build_version =
+                    read_device_string(&libs, info.device, "BuildVersion", "Unknown");
+                (libs.am_device_stop_session)(info.device);
+            }
+
+            (libs.am_device_disconnect)(info.device);
+        }
+    }
+
+    if let Ok(mut devices) = legacy_enum_devices().lock() {
+        if !devices.iter().any(|d| d.udid.eq_ignore_ascii_case(&device_info.udid)) {
+            devices.push(device_info);
+        }
+    }
+}
+
+extern "C" fn legacy_find_notification_device(
+    info: *const AMDeviceNotificationCallbackInfo,
+) {
+    if info.is_null() {
+        return;
+    }
+    let info = unsafe { &*info };
+    if info.device.is_null() || info.message != 1 {
+        return;
+    }
+
+    let Ok(libs) = get_apple_libraries() else {
+        return;
+    };
+
+    let identifier = unsafe { (libs.am_device_copy_device_identifier)(info.device) };
+    if identifier.is_null() {
+        return;
+    }
+    let udid = libs.to_rust_string(identifier);
+    unsafe { (libs.cf_release)(identifier) };
+    if udid.is_empty() {
+        return;
+    }
+
+    let matches = legacy_find_target()
+        .lock()
+        .ok()
+        .and_then(|target| target.as_ref().map(|t| t.eq_ignore_ascii_case(&udid)))
+        .unwrap_or(true);
+    if !matches {
+        return;
+    }
+
+    if let Ok(mut result) = legacy_find_result().lock() {
+        if result.is_none() {
+            let retained = unsafe { (libs.cf_retain)(info.device) as usize };
+            *result = Some((retained, udid));
+        }
+    }
+
+    let run_loop = unsafe { (libs.cf_run_loop_get_main)() };
+    if !run_loop.is_null() {
+        unsafe { (libs.cf_run_loop_stop)(run_loop) };
+    }
+}
+
+fn run_legacy_notification_enumeration(
+    libs: Arc<AppleLibraries>,
+) -> Result<Vec<DeviceInfo>> {
+    if let Ok(mut devices) = legacy_enum_devices().lock() {
+        devices.clear();
+    }
+
+    let mut subscription: AMDeviceNotificationRef = ptr::null();
+    let status = unsafe {
+        (libs.am_device_notification_subscribe_legacy)(
+            legacy_enumerate_notification_device,
+            0,
+            0,
+            0,
+            &mut subscription,
+        )
+    };
+    if status != 0 {
+        bail!("AMDeviceNotificationSubscribe failed with code {}", status);
+    }
+
+    if let Ok(mode) = libs.create_cf_string("kCFRunLoopDefaultMode") {
+        unsafe {
+            (libs.cf_run_loop_run_in_mode)(mode.raw, 2.0, 0);
+        }
+    }
+
+    if !subscription.is_null() {
+        unsafe {
+            (libs.am_device_notification_unsubscribe)(subscription);
+        }
+    }
+
+    Ok(legacy_enum_devices()
+        .lock()
+        .map(|devices| devices.clone())
+        .unwrap_or_default())
+}
+
+fn find_device_via_legacy_notifications(
+    libs: Arc<AppleLibraries>,
+    target_udid: Option<&str>,
+) -> Result<Option<(AMDeviceRef, String)>> {
+    if let Ok(mut target) = legacy_find_target().lock() {
+        *target = target_udid.map(str::to_string);
+    }
+    if let Ok(mut result) = legacy_find_result().lock() {
+        *result = None;
+    }
+
+    let mut subscription: AMDeviceNotificationRef = ptr::null();
+    let status = unsafe {
+        (libs.am_device_notification_subscribe_legacy)(
+            legacy_find_notification_device,
+            0,
+            0,
+            0,
+            &mut subscription,
+        )
+    };
+    if status != 0 {
+        bail!("AMDeviceNotificationSubscribe failed with code {}", status);
+    }
+
+    if let Ok(mode) = libs.create_cf_string("kCFRunLoopDefaultMode") {
+        unsafe {
+            (libs.cf_run_loop_run_in_mode)(mode.raw, 3.0, 0);
+        }
+    }
+
+    if !subscription.is_null() {
+        unsafe {
+            (libs.am_device_notification_unsubscribe)(subscription);
+        }
+    }
+
+    let found = legacy_find_result().lock().ok().and_then(|mut result| result.take());
+    Ok(found.map(|(device, udid)| (device as AMDeviceRef, udid)))
+}
+
 struct NotificationListContext {
     libs: Arc<AppleLibraries>,
     devices: Vec<DeviceInfo>,
@@ -216,6 +437,11 @@ extern "C" fn enumerate_notification_device(
 }
 
 fn run_notification_enumeration(libs: Arc<AppleLibraries>) -> Result<Vec<DeviceInfo>> {
+    let legacy = run_legacy_notification_enumeration(Arc::clone(&libs))?;
+    if !legacy.is_empty() {
+        return Ok(legacy);
+    }
+
     let mut context = NotificationListContext {
         libs: Arc::clone(&libs),
         devices: Vec::new(),
@@ -233,7 +459,7 @@ fn run_notification_enumeration(libs: Arc<AppleLibraries>) -> Result<Vec<DeviceI
         )
     };
     if status != 0 {
-        bail!("AMDeviceNotificationSubscribeWithOptions failed with code {}", status);
+        return Ok(Vec::new());
     }
 
     if let Ok(mode) = libs.create_cf_string("kCFRunLoopDefaultMode") {
@@ -308,6 +534,12 @@ fn find_device_via_notifications(
     libs: Arc<AppleLibraries>,
     target_udid: Option<&str>,
 ) -> Result<Option<(AMDeviceRef, String)>> {
+    if let Some(found) =
+        find_device_via_legacy_notifications(Arc::clone(&libs), target_udid)?
+    {
+        return Ok(Some(found));
+    }
+
     let mut context = NotificationFindContext {
         libs: Arc::clone(&libs),
         target_udid: target_udid.map(str::to_string),
@@ -327,7 +559,7 @@ fn find_device_via_notifications(
         )
     };
     if status != 0 {
-        bail!("AMDeviceNotificationSubscribeWithOptions failed with code {}", status);
+        return Ok(None);
     }
 
     if let Ok(mode) = libs.create_cf_string("kCFRunLoopDefaultMode") {
