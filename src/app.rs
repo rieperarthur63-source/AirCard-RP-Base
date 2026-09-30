@@ -155,7 +155,7 @@ impl AirCardApp {
             show_logs_window: false,
         };
 
-        app.add_log("AirCard Windows v1.2.1 initialized");
+        app.add_log("AirCard RP v1.0 initialized");
         app.add_log(format!("Apple Support Runtime: {}", if app.apple_ready { "Loaded and operational" } else { "Not found (iTunes required)" }));
         app.add_log(format!("Loaded {} saved card(s) from database", app.saved_cards.len()));
 
@@ -175,7 +175,7 @@ impl AirCardApp {
     }
 
     fn refresh_devices(&mut self) {
-        self.add_log("Scanning for connected iOS devices via usbmuxd...");
+        self.add_log("Procurando iPhone via usbmuxd e fallback MobileDevice...");
         match list_connected_devices() {
             Ok(devs) => {
                 self.devices = devs;
@@ -1054,6 +1054,11 @@ impl eframe::App for AirCardApp {
                                     &mut next_language,
                                     Language::English,
                                     language.option_label(Language::English),
+                                );
+                                ui.selectable_value(
+                                    &mut next_language,
+                                    Language::PortugueseBrazil,
+                                    language.option_label(Language::PortugueseBrazil),
                                 );
                                 ui.selectable_value(
                                     &mut next_language,
