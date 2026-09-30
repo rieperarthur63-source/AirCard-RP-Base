@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::ptr;
@@ -8,7 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::apple::{
-    AMDServiceConnectionRef, AMDeviceRef, AppleLibraries, get_apple_libraries,
+    AMDServiceConnectionRef, AMDeviceNotificationCallbackInfo, AMDeviceNotificationRef,
+    AMDeviceRef, AppleLibraries, get_apple_libraries,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -114,6 +116,238 @@ pub struct UsbmuxDeviceEntry {
     pub properties_plist: Vec<u8>,
 }
 
+
+struct NotificationListContext {
+    libs: Arc<AppleLibraries>,
+    devices: Vec<DeviceInfo>,
+}
+
+fn read_device_string(
+    libs: &AppleLibraries,
+    device: AMDeviceRef,
+    key: &str,
+    fallback: &str,
+) -> String {
+    let Ok(cf_key) = libs.create_cf_string(key) else {
+        return fallback.to_string();
+    };
+    let value = unsafe { (libs.am_device_copy_value)(device, ptr::null(), cf_key.raw) };
+    if value.is_null() {
+        return fallback.to_string();
+    }
+    let text = libs.to_rust_string(value);
+    unsafe { (libs.cf_release)(value) };
+    if text.is_empty() {
+        fallback.to_string()
+    } else {
+        text
+    }
+}
+
+extern "C" fn enumerate_notification_device(
+    info: *const AMDeviceNotificationCallbackInfo,
+    context: *mut c_void,
+) {
+    if info.is_null() || context.is_null() {
+        return;
+    }
+
+    let info = unsafe { &*info };
+    if info.device.is_null() || info.message != 1 {
+        return;
+    }
+
+    let context = unsafe { &mut *(context as *mut NotificationListContext) };
+    let libs = &context.libs;
+
+    let identifier = unsafe { (libs.am_device_copy_device_identifier)(info.device) };
+    if identifier.is_null() {
+        return;
+    }
+    let udid = libs.to_rust_string(identifier);
+    unsafe { (libs.cf_release)(identifier) };
+    if udid.is_empty()
+        || context
+            .devices
+            .iter()
+            .any(|device| device.udid.eq_ignore_ascii_case(&udid))
+    {
+        return;
+    }
+
+    let mut device_info = DeviceInfo {
+        udid,
+        name: "iPhone".to_string(),
+        product_type: "iPhone".to_string(),
+        ios_version: "Unknown".to_string(),
+        build_version: "Unknown".to_string(),
+        transports: vec![DeviceTransport::Usb],
+    };
+
+    unsafe {
+        if (libs.am_device_connect)(info.device) == 0 {
+            if (libs.am_device_is_paired)(info.device) == 0 {
+                let _ = (libs.am_device_pair)(info.device);
+            }
+
+            let mut pairing_status = (libs.am_device_validate_pairing)(info.device);
+            if pairing_status != 0 {
+                let _ = (libs.am_device_pair)(info.device);
+                pairing_status = (libs.am_device_validate_pairing)(info.device);
+            }
+
+            if pairing_status == 0 && (libs.am_device_start_session)(info.device) == 0 {
+                device_info.name =
+                    read_device_string(libs, info.device, "DeviceName", "iPhone");
+                device_info.product_type =
+                    read_device_string(libs, info.device, "ProductType", "iPhone");
+                device_info.ios_version =
+                    read_device_string(libs, info.device, "ProductVersion", "Unknown");
+                device_info.build_version =
+                    read_device_string(libs, info.device, "BuildVersion", "Unknown");
+                (libs.am_device_stop_session)(info.device);
+            }
+
+            (libs.am_device_disconnect)(info.device);
+        }
+    }
+
+    context.devices.push(device_info);
+}
+
+fn run_notification_enumeration(libs: Arc<AppleLibraries>) -> Result<Vec<DeviceInfo>> {
+    let mut context = NotificationListContext {
+        libs: Arc::clone(&libs),
+        devices: Vec::new(),
+    };
+    let mut subscription: AMDeviceNotificationRef = ptr::null();
+
+    let status = unsafe {
+        (libs.am_device_notification_subscribe)(
+            enumerate_notification_device,
+            0,
+            0,
+            &mut context as *mut NotificationListContext as *mut c_void,
+            &mut subscription,
+            ptr::null(),
+        )
+    };
+    if status != 0 {
+        bail!("AMDeviceNotificationSubscribeWithOptions failed with code {}", status);
+    }
+
+    if let Ok(mode) = libs.create_cf_string("kCFRunLoopDefaultMode") {
+        unsafe {
+            (libs.cf_run_loop_run_in_mode)(mode.raw, 2.0, 0);
+        }
+    }
+
+    if !subscription.is_null() {
+        unsafe {
+            (libs.am_device_notification_unsubscribe)(subscription);
+        }
+    }
+
+    Ok(context.devices)
+}
+
+struct NotificationFindContext {
+    libs: Arc<AppleLibraries>,
+    target_udid: Option<String>,
+    device: AMDeviceRef,
+    udid: Option<String>,
+}
+
+extern "C" fn find_notification_device(
+    info: *const AMDeviceNotificationCallbackInfo,
+    context: *mut c_void,
+) {
+    if info.is_null() || context.is_null() {
+        return;
+    }
+
+    let info = unsafe { &*info };
+    if info.device.is_null() || info.message != 1 {
+        return;
+    }
+
+    let context = unsafe { &mut *(context as *mut NotificationFindContext) };
+    if !context.device.is_null() {
+        return;
+    }
+
+    let identifier = unsafe { (context.libs.am_device_copy_device_identifier)(info.device) };
+    if identifier.is_null() {
+        return;
+    }
+    let udid = context.libs.to_rust_string(identifier);
+    unsafe { (context.libs.cf_release)(identifier) };
+    if udid.is_empty() {
+        return;
+    }
+
+    let matches = context
+        .target_udid
+        .as_ref()
+        .map(|target| target.eq_ignore_ascii_case(&udid))
+        .unwrap_or(true);
+    if !matches {
+        return;
+    }
+
+    context.device = unsafe { (context.libs.cf_retain)(info.device) as AMDeviceRef };
+    context.udid = Some(udid);
+
+    let run_loop = unsafe { (context.libs.cf_run_loop_get_main)() };
+    if !run_loop.is_null() {
+        unsafe { (context.libs.cf_run_loop_stop)(run_loop) };
+    }
+}
+
+fn find_device_via_notifications(
+    libs: Arc<AppleLibraries>,
+    target_udid: Option<&str>,
+) -> Result<Option<(AMDeviceRef, String)>> {
+    let mut context = NotificationFindContext {
+        libs: Arc::clone(&libs),
+        target_udid: target_udid.map(str::to_string),
+        device: ptr::null(),
+        udid: None,
+    };
+    let mut subscription: AMDeviceNotificationRef = ptr::null();
+
+    let status = unsafe {
+        (libs.am_device_notification_subscribe)(
+            find_notification_device,
+            0,
+            0,
+            &mut context as *mut NotificationFindContext as *mut c_void,
+            &mut subscription,
+            ptr::null(),
+        )
+    };
+    if status != 0 {
+        bail!("AMDeviceNotificationSubscribeWithOptions failed with code {}", status);
+    }
+
+    if let Ok(mode) = libs.create_cf_string("kCFRunLoopDefaultMode") {
+        unsafe {
+            (libs.cf_run_loop_run_in_mode)(mode.raw, 3.0, 0);
+        }
+    }
+
+    if !subscription.is_null() {
+        unsafe {
+            (libs.am_device_notification_unsubscribe)(subscription);
+        }
+    }
+
+    match (context.device.is_null(), context.udid) {
+        (false, Some(udid)) => Ok(Some((context.device, udid))),
+        _ => Ok(None),
+    }
+}
+
 pub fn query_usbmux_devices() -> Result<Vec<UsbmuxDeviceEntry>> {
     let addr: SocketAddr = "127.0.0.1:27015".parse().unwrap();
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
@@ -199,68 +433,82 @@ pub fn query_usbmux_devices() -> Result<Vec<UsbmuxDeviceEntry>> {
 
 pub fn list_connected_devices() -> Result<Vec<DeviceInfo>> {
     let libs = get_apple_libraries()?;
-    let entries = query_usbmux_devices()?;
-
     let mut result = Vec::new();
+    let mut mux_error: Option<anyhow::Error> = None;
 
-    for entry in entries {
-        let cf_props = libs.create_cf_plist_from_bytes(&entry.properties_plist)?;
-        let dev = unsafe { (libs.am_device_create_from_properties)(cf_props.raw) };
-        if dev.is_null() {
-            continue;
-        }
+    match query_usbmux_devices() {
+        Ok(entries) => {
+            for entry in entries {
+                let cf_props = libs.create_cf_plist_from_bytes(&entry.properties_plist)?;
+                let dev = unsafe { (libs.am_device_create_from_properties)(cf_props.raw) };
+                if dev.is_null() {
+                    continue;
+                }
 
-        let mut name = "iPhone".to_string();
-        let mut product_type = "iPhone".to_string();
-        let mut ios_version = "Unknown".to_string();
-        let mut build_version = "Unknown".to_string();
+                let mut name = "iPhone".to_string();
+                let mut product_type = "iPhone".to_string();
+                let mut ios_version = "Unknown".to_string();
+                let mut build_version = "Unknown".to_string();
 
-        unsafe {
-            let connected = (libs.am_device_connect)(dev) == 0;
-            if connected {
-                let _ = (libs.am_device_validate_pairing)(dev);
+                unsafe {
+                    let connected = (libs.am_device_connect)(dev) == 0;
+                    if connected {
+                        let _ = (libs.am_device_validate_pairing)(dev);
 
-                if let Ok(k) = libs.create_cf_string("DeviceName") {
-                    let v = (libs.am_device_copy_value)(dev, ptr::null(), k.raw);
-                    if !v.is_null() {
-                        name = libs.to_rust_string(v);
-                        (libs.cf_release)(v);
+                        name = read_device_string(&libs, dev, "DeviceName", "iPhone");
+                        product_type =
+                            read_device_string(&libs, dev, "ProductType", "iPhone");
+                        ios_version =
+                            read_device_string(&libs, dev, "ProductVersion", "Unknown");
+                        build_version =
+                            read_device_string(&libs, dev, "BuildVersion", "Unknown");
+
+                        (libs.am_device_disconnect)(dev);
                     }
+                    (libs.cf_release)(dev);
                 }
-                if let Ok(k) = libs.create_cf_string("ProductType") {
-                    let v = (libs.am_device_copy_value)(dev, ptr::null(), k.raw);
-                    if !v.is_null() {
-                        product_type = libs.to_rust_string(v);
-                        (libs.cf_release)(v);
-                    }
-                }
-                if let Ok(k) = libs.create_cf_string("ProductVersion") {
-                    let v = (libs.am_device_copy_value)(dev, ptr::null(), k.raw);
-                    if !v.is_null() {
-                        ios_version = libs.to_rust_string(v);
-                        (libs.cf_release)(v);
-                    }
-                }
-                if let Ok(k) = libs.create_cf_string("BuildVersion") {
-                    let v = (libs.am_device_copy_value)(dev, ptr::null(), k.raw);
-                    if !v.is_null() {
-                        build_version = libs.to_rust_string(v);
-                        (libs.cf_release)(v);
-                    }
-                }
-                (libs.am_device_disconnect)(dev);
+
+                merge_device_info(&mut result, DeviceInfo {
+                    udid: entry.udid,
+                    name,
+                    product_type,
+                    ios_version,
+                    build_version,
+                    transports: vec![entry.transport],
+                });
             }
-            (libs.cf_release)(dev);
         }
+        Err(error) => {
+            mux_error = Some(error);
+        }
+    }
 
-        merge_device_info(&mut result, DeviceInfo {
-            udid: entry.udid,
-            name,
-            product_type,
-            ios_version,
-            build_version,
-            transports: vec![entry.transport],
-        });
+    // Some Windows Apple Mobile Device installations expose the iPhone through
+    // MobileDevice notifications even when usbmuxd's ListDevices response is empty.
+    // Use the same MobileDevice notification path as the original AirCard client
+    // as a USB fallback so a valid Apple driver/service stack can still work.
+    if result.is_empty() {
+        match run_notification_enumeration(Arc::clone(&libs)) {
+            Ok(devices) => {
+                for device in devices {
+                    merge_device_info(&mut result, device);
+                }
+            }
+            Err(notification_error) => {
+                if let Some(mux_error) = mux_error {
+                    bail!(
+                        "usbmuxd scan failed: {mux_error:#}; MobileDevice fallback failed: {notification_error:#}"
+                    );
+                }
+                return Err(notification_error);
+            }
+        }
+    }
+
+    if result.is_empty() {
+        if let Some(mux_error) = mux_error {
+            return Err(mux_error);
+        }
     }
 
     Ok(result)
@@ -366,16 +614,8 @@ impl Drop for ActiveDeviceSession {
 impl ActiveDeviceSession {
     pub fn open(target_udid: Option<&str>, mode: ConnectionMode) -> Result<Self> {
         let libs = get_apple_libraries()?;
-        let entries = query_usbmux_devices()?;
+        let entries = query_usbmux_devices().unwrap_or_default();
         let candidates = ordered_candidates(entries, target_udid, mode);
-        if candidates.is_empty() {
-            let target = target_udid.unwrap_or("any paired iPhone");
-            bail!(
-                "No {} connection is available for {}. For WiFi, pair once over USB, enable WiFi sync, then keep both devices on the same network.",
-                mode.label(),
-                target
-            );
-        }
 
         let mut failures = Vec::new();
         for entry in candidates {
@@ -386,7 +626,38 @@ impl ActiveDeviceSession {
             }
         }
 
-        bail!("Could not open iPhone session. {}", failures.join("; "))
+        if mode != ConnectionMode::Wifi {
+            match find_device_via_notifications(Arc::clone(&libs), target_udid) {
+                Ok(Some((device, udid))) => {
+                    match Self::open_device_ref(
+                        Arc::clone(&libs),
+                        device,
+                        udid,
+                        DeviceTransport::Usb,
+                    ) {
+                        Ok(session) => return Ok(session),
+                        Err(err) => failures.push(format!("MobileDevice USB fallback: {err:#}")),
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => failures.push(format!("MobileDevice USB fallback scan: {err:#}")),
+            }
+        }
+
+        let target = target_udid.unwrap_or("any paired iPhone");
+        if failures.is_empty() {
+            bail!(
+                "No {} connection is available for {}. Unlock the iPhone, tap Trust, then reconnect USB and refresh.",
+                mode.label(),
+                target
+            );
+        }
+
+        bail!(
+            "Could not open iPhone session for {}. {}",
+            target,
+            failures.join("; ")
+        )
     }
 
     fn open_entry(libs: Arc<AppleLibraries>, entry: UsbmuxDeviceEntry) -> Result<Self> {
@@ -394,12 +665,21 @@ impl ActiveDeviceSession {
         let transport = entry.transport;
         let cf_props = libs.create_cf_plist_from_bytes(&entry.properties_plist)?;
 
-        unsafe {
-            let device = (libs.am_device_create_from_properties)(cf_props.raw);
-            if device.is_null() {
-                bail!("AMDeviceCreateFromProperties failed");
-            }
+        let device = unsafe { (libs.am_device_create_from_properties)(cf_props.raw) };
+        if device.is_null() {
+            bail!("AMDeviceCreateFromProperties failed");
+        }
 
+        Self::open_device_ref(libs, device, udid, transport)
+    }
+
+    fn open_device_ref(
+        libs: Arc<AppleLibraries>,
+        device: AMDeviceRef,
+        udid: String,
+        transport: DeviceTransport,
+    ) -> Result<Self> {
+        unsafe {
             let connect_status = (libs.am_device_connect)(device);
             if connect_status != 0 {
                 (libs.cf_release)(device);
@@ -424,7 +704,7 @@ impl ActiveDeviceSession {
                 (libs.am_device_disconnect)(device);
                 (libs.cf_release)(device);
                 bail!(
-                    "AMDeviceValidatePairing failed with code {} over {}. Unlock the iPhone; WiFi connections must be trusted over USB first.",
+                    "AMDeviceValidatePairing failed with code {} over {}. Unlock the iPhone and trust this computer, then retry.",
                     validate_status,
                     transport.label()
                 );
