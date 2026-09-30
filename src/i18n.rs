@@ -6,12 +6,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Language {
     English,
+    PortugueseBrazil,
     SimplifiedChinese,
 }
 
 impl Default for Language {
     fn default() -> Self {
-        Self::English
+        Self::PortugueseBrazil
     }
 }
 
@@ -32,8 +33,10 @@ impl Language {
 
         if system_locale.starts_with("zh") {
             Self::SimplifiedChinese
-        } else {
+        } else if system_locale.starts_with("en") {
             Self::English
+        } else {
+            Self::PortugueseBrazil
         }
     }
 
@@ -52,6 +55,98 @@ impl Language {
     pub fn text<'a>(self, source: &'a str) -> &'a str {
         if self == Self::English {
             return source;
+        }
+
+        if self == Self::PortugueseBrazil {
+            return match source {
+                "Wallet" => "Carteira",
+                "Passcode" => "Código",
+                "Help" => "Ajuda",
+                "Refresh" => "Atualizar",
+                "Auto (USB preferred)" => "Automático (priorizar USB)",
+                "USB only" => "Somente USB",
+                "WiFi only" => "Somente Wi‑Fi",
+                "No device" => "Nenhum iPhone",
+                "Ready" => "Pronto",
+                "Unavailable" => "Indisponível",
+                "Logs" => "Logs",
+                "Logs [x]" => "Logs [x]",
+                "Copy Logs" => "Copiar logs",
+                "Save to File..." => "Salvar em arquivo...",
+                "Clear" => "Limpar",
+                "No events logged yet." => "Nenhum evento registrado.",
+                "Language" => "Idioma",
+                "English" => "Inglês",
+                "Portuguese (Brazil)" => "Português (Brasil)",
+                "Simplified Chinese" => "Chinês simplificado",
+                "Language changed." => "Idioma alterado.",
+                "Transport mode" => "Conexão",
+                "entries" => "registros",
+                "Ready. Connect iPhone via USB or paired WiFi and unlock it." => "Pronto. Conecte e desbloqueie o iPhone.",
+                "No iPhone connected via USB or paired WiFi." => "Nenhum iPhone detectado. Conecte por USB, desbloqueie e toque em Confiar.",
+                "Please select a connected iPhone." => "Selecione um iPhone conectado.",
+                "Please enter or scan a target card hash." => "Informe ou escaneie o hash do cartão.",
+                "Please choose a card skin image first." => "Escolha primeiro a imagem do cartão.",
+                "Crop position updated." => "Posição do recorte atualizada.",
+                "Scanning syslog... Open Wallet or tap your card on iPhone." => "Escaneando... Abra a Carteira no iPhone e toque no cartão.",
+                "Syslog scanning stopped." => "Escaneamento interrompido.",
+                "Writing card skin to iPhone..." => "Aplicando a nova imagem no iPhone...",
+                "Card skin successfully flashed! Force quit Wallet on iPhone and reopen it." => "Imagem aplicada! Feche a Carteira no iPhone e abra novamente.",
+                "Card skin updated successfully!" => "Imagem do cartão atualizada!",
+                "Restoring original card face..." => "Restaurando imagem original do cartão...",
+                "Restoring original card artwork..." => "Restaurando arte original do cartão...",
+                "Original card face restored successfully!" => "Imagem original restaurada!",
+                "Original card face restored. Force close Wallet and reopen it." => "Imagem original restaurada. Feche a Carteira e abra novamente.",
+                "Original card backup not found." => "Backup da imagem original não encontrado.",
+                "Apply a card skin once to create an original backup." => "Aplique uma imagem uma vez para criar o backup original.",
+                "Error: " => "Erro: ",
+                "Found" => "Encontrado(s)",
+                "connected device(s); transport mode:" => "iPhone(s) conectado(s); modo:",
+                "Could not enumerate devices:" => "Não foi possível detectar o iPhone:",
+                "Selected iPhone has no" => "O iPhone selecionado não tem conexão",
+                "connection. Refresh devices or change transport mode." => "disponível. Atualize ou altere o modo de conexão.",
+                "Scanning syslog..." => "Escaneando...",
+                "Open Wallet on iPhone and tap your card" => "Abra a Carteira no iPhone e toque no cartão",
+                "Stop" => "Parar",
+                "Scan" => "Escanear",
+                "Card Configuration" => "Configuração do cartão",
+                "Target your card and choose replacement artwork" => "Selecione o cartão e escolha a nova imagem",
+                "Target Card Hash" => "Hash do cartão",
+                "Base64 pass hash..." => "Hash Base64 do cartão...",
+                "Saved cards" => "Cartões salvos",
+                "Select..." => "Selecionar...",
+                "Card Skin Artwork" => "Imagem do cartão",
+                "PNG, JPG, WebP - auto-scaled to 1536x969" => "PNG, JPG ou WebP — ajustado automaticamente",
+                "Drag inside the preview to reposition the crop." => "Arraste a prévia para ajustar o recorte.",
+                "Choose Image..." => "Escolher imagem...",
+                "Export PNG" => "Exportar PNG",
+                "Write to iPhone" => "Aplicar no iPhone",
+                "Apply Card Skin" => "Aplicar imagem",
+                "Restore Original" => "Restaurar original",
+                "connect iPhone" => "conectar o iPhone",
+                "choose available transport" => "escolher conexão disponível",
+                "enter card hash" => "informar hash do cartão",
+                "choose image" => "escolher imagem",
+                "Wallet Preview" => "Prévia da Carteira",
+                "1536 x 969 px pass canvas" => "Prévia 1536 × 969 px",
+                "No artwork loaded" => "Nenhuma imagem carregada",
+                "No image" => "Sem imagem",
+                "After applying, force close Apple Wallet and reopen it." => "Depois de aplicar, feche a Carteira no iPhone e abra novamente.",
+                "Setup & Card Hash Guide" => "Guia de conexão e hash do cartão",
+                "Everything you need to connect and capture your card" => "Tudo para conectar o iPhone e identificar o cartão",
+                "Prerequisites" => "Pré-requisitos",
+                "- 64-bit iTunes or Apple Mobile Device Support installed" => "- Apple Mobile Device Support 64 bits instalado",
+                "- First-time setup: connect by USB and tap \"Trust this Computer\"" => "- Primeira conexão: conecte por USB e toque em \"Confiar\"",
+                "- WiFi: enable WiFi sync, then use the same local network" => "- Wi‑Fi: ative a sincronização e use a mesma rede",
+                "- Select Auto, USB only, or WiFi only in the top bar" => "- Escolha Automático, USB ou Wi‑Fi na barra superior",
+                "Finding Your Card Hash" => "Como encontrar o hash do cartão",
+                "1. Click \"Scan\" in the Wallet tab" => "1. Clique em \"Escanear\" na aba Carteira",
+                "2. Open Apple Wallet on your iPhone" => "2. Abra a Carteira no iPhone",
+                "3. Tap the card you want to customize" => "3. Toque no cartão que deseja personalizar",
+                "4. AirCard captures the pass hash automatically" => "4. O AirCard RP captura o hash automaticamente",
+                "5. Click \"Stop\" once detected" => "5. Clique em \"Parar\" quando detectar",
+                _ => source,
+            };
         }
 
         match source {
@@ -202,13 +297,23 @@ impl Language {
     }
 
     pub fn option_label(self, option: Self) -> &'static str {
-        match (self, option) {
-            (Self::English, Self::English) => "English",
-            (Self::English, Self::SimplifiedChinese) => "Simplified Chinese",
-            (Self::SimplifiedChinese, Self::English) => "英语",
-            (Self::SimplifiedChinese, Self::SimplifiedChinese) => "简体中文",
+        match option {
+            Self::English => match self {
+                Self::SimplifiedChinese => "英语",
+                Self::PortugueseBrazil => "Inglês",
+                Self::English => "English",
+            },
+            Self::PortugueseBrazil => match self {
+                Self::SimplifiedChinese => "葡萄牙语（巴西）",
+                _ => "Português (Brasil)",
+            },
+            Self::SimplifiedChinese => match self {
+                Self::SimplifiedChinese => "简体中文",
+                Self::PortugueseBrazil => "Chinês simplificado",
+                Self::English => "Simplified Chinese",
+            },
         }
-    }
+
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,7 +325,7 @@ fn settings_path() -> PathBuf {
     let local_app_data = std::env::var("LOCALAPPDATA")
         .unwrap_or_else(|_| r"C:\Users\Default\AppData\Local".to_string());
     PathBuf::from(local_app_data)
-        .join("AirCard")
+        .join("AirCard-RP")
         .join("settings.json")
 }
 
