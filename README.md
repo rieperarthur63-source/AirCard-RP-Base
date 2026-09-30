@@ -126,3 +126,6 @@ If you find AirCard useful, you can support future development:
 - **USDT (TRC20)**: `TLiVnkPZ7mVKwCD9RfE28uVTFk6sD6rux2`
 - **USDT / BNB (BEP20)**: `0x8EA94e79e47FafBCE10E65342D875c86d1019541`
 
+
+
+<!-- AirCard RP custom build -->
