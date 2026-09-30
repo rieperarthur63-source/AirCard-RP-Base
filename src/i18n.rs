@@ -313,7 +313,7 @@ impl Language {
                 Self::English => "Simplified Chinese",
             },
         }
-
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
