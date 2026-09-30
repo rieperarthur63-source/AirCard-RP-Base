@@ -663,6 +663,188 @@ pub fn query_usbmux_devices() -> Result<Vec<UsbmuxDeviceEntry>> {
     Ok(result)
 }
 
+
+fn parse_usbmux_entry_from_dictionary(
+    d: &plist::Dictionary,
+) -> Result<Option<UsbmuxDeviceEntry>> {
+    let Some(props_val) = d.get("Properties") else {
+        return Ok(None);
+    };
+    let Some(props_dict) = props_val.as_dictionary() else {
+        return Ok(None);
+    };
+
+    let serial = props_dict
+        .get("SerialNumber")
+        .and_then(|v| v.as_string())
+        .unwrap_or_default()
+        .to_string();
+    if serial.is_empty() {
+        return Ok(None);
+    }
+
+    let connection_type = props_dict
+        .get("ConnectionType")
+        .and_then(|v| v.as_string())
+        .unwrap_or("USB");
+    let transport = DeviceTransport::from_usbmux(connection_type);
+
+    let mut props_binary = Vec::new();
+    plist::to_writer_binary(&mut props_binary, props_val)
+        .context("Failed to serialize usbmux device properties")?;
+
+    Ok(Some(UsbmuxDeviceEntry {
+        udid: serial,
+        transport,
+        properties_plist: props_binary,
+    }))
+}
+
+fn read_usbmux_plist(stream: &mut TcpStream) -> Result<plist::Value> {
+    let mut resp_header = [0u8; 16];
+    stream
+        .read_exact(&mut resp_header)
+        .context("Failed to read usbmux response header")?;
+
+    let resp_len = u32::from_le_bytes([
+        resp_header[0],
+        resp_header[1],
+        resp_header[2],
+        resp_header[3],
+    ]) as usize;
+    if resp_len < 16 || resp_len > 16 * 1024 * 1024 {
+        bail!("Invalid usbmux response length: {}", resp_len);
+    }
+
+    let mut payload = vec![0u8; resp_len - 16];
+    stream
+        .read_exact(&mut payload)
+        .context("Failed to read usbmux response payload")?;
+
+    plist::Value::from_reader(std::io::Cursor::new(payload))
+        .context("Failed to parse usbmux response plist")
+}
+
+fn send_usbmux_request(
+    stream: &mut TcpStream,
+    message_type: &str,
+    tag: u32,
+) -> Result<()> {
+    let mut req_dict = HashMap::new();
+    req_dict.insert(
+        "MessageType".to_string(),
+        plist::Value::String(message_type.to_string()),
+    );
+    req_dict.insert(
+        "ClientVersionString".to_string(),
+        plist::Value::String("AirCard-RP".to_string()),
+    );
+    req_dict.insert(
+        "ProgName".to_string(),
+        plist::Value::String("AirCard-RP".to_string()),
+    );
+
+    let mut plist_bytes = Vec::new();
+    plist::to_writer_xml(
+        &mut plist_bytes,
+        &plist::Value::Dictionary(req_dict.into_iter().collect()),
+    )
+    .context("Failed to serialize usbmux request")?;
+
+    let length = (plist_bytes.len() + 16) as u32;
+    let mut header = Vec::with_capacity(16);
+    header.extend_from_slice(&length.to_le_bytes());
+    header.extend_from_slice(&1u32.to_le_bytes());
+    header.extend_from_slice(&8u32.to_le_bytes());
+    header.extend_from_slice(&tag.to_le_bytes());
+
+    stream.write_all(&header)?;
+    stream.write_all(&plist_bytes)?;
+    stream.flush()?;
+    Ok(())
+}
+
+pub fn query_usbmux_listen_devices() -> Result<Vec<UsbmuxDeviceEntry>> {
+    let addr: SocketAddr = "127.0.0.1:27015".parse().unwrap();
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .context("Could not connect to Apple Mobile Device Service listener at 127.0.0.1:27015")?;
+
+    stream.set_read_timeout(Some(Duration::from_millis(900)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+    send_usbmux_request(&mut stream, "Listen", 41)?;
+
+    let first = read_usbmux_plist(&mut stream)?;
+    if let Some(dict) = first.as_dictionary() {
+        if dict.get("MessageType").and_then(|v| v.as_string()) == Some("Result") {
+            let number = dict
+                .get("Number")
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(0);
+            if number != 0 {
+                bail!("usbmux Listen failed with result {}", number);
+            }
+        }
+    }
+
+    let mut devices = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match read_usbmux_plist(&mut stream) {
+            Ok(value) => {
+                let Some(dict) = value.as_dictionary() else {
+                    continue;
+                };
+                if dict.get("MessageType").and_then(|v| v.as_string()) != Some("Attached") {
+                    continue;
+                }
+                if let Some(entry) = parse_usbmux_entry_from_dictionary(dict)? {
+                    if !devices.iter().any(|existing: &UsbmuxDeviceEntry| {
+                        existing.udid.eq_ignore_ascii_case(&entry.udid)
+                            && existing.transport == entry.transport
+                    }) {
+                        devices.push(entry);
+                    }
+                }
+            }
+            Err(error) => {
+                let text = format!("{error:#}");
+                if text.contains("timed out")
+                    || text.contains("would block")
+                    || text.contains("os error 10060")
+                {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(devices)
+}
+
+pub fn query_usbmux_devices_resilient() -> Result<Vec<UsbmuxDeviceEntry>> {
+    let mut entries = match query_usbmux_devices_resilient() {
+        Ok(entries) => entries,
+        Err(_) => Vec::new(),
+    };
+
+    if entries.is_empty() {
+        if let Ok(listened) = query_usbmux_listen_devices() {
+            for entry in listened {
+                if !entries.iter().any(|existing| {
+                    existing.udid.eq_ignore_ascii_case(&entry.udid)
+                        && existing.transport == entry.transport
+                }) {
+                    entries.push(entry);
+                }
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
 pub fn list_connected_devices() -> Result<Vec<DeviceInfo>> {
     let libs = get_apple_libraries()?;
     let mut result = Vec::new();
@@ -803,7 +985,7 @@ pub fn ensure_transport_available(
     udid: &str,
     transport: DeviceTransport,
 ) -> Result<()> {
-    let available = query_usbmux_devices()?.into_iter().any(|entry| {
+    let available = query_usbmux_devices_resilient()?.into_iter().any(|entry| {
         entry.udid.eq_ignore_ascii_case(udid) && entry.transport == transport
     });
     if available {
@@ -846,7 +1028,7 @@ impl Drop for ActiveDeviceSession {
 impl ActiveDeviceSession {
     pub fn open(target_udid: Option<&str>, mode: ConnectionMode) -> Result<Self> {
         let libs = get_apple_libraries()?;
-        let entries = query_usbmux_devices().unwrap_or_default();
+        let entries = query_usbmux_devices_resilient().unwrap_or_default();
         let candidates = ordered_candidates(entries, target_udid, mode);
 
         let mut failures = Vec::new();
