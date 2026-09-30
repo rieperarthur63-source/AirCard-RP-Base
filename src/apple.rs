@@ -47,6 +47,8 @@ pub struct AMDeviceNotificationCallbackInfo {
 
 pub type AMDeviceNotificationCallback =
     extern "C" fn(*const AMDeviceNotificationCallbackInfo, *mut std::ffi::c_void);
+pub type AMDeviceLegacyNotificationCallback =
+    extern "C" fn(*const AMDeviceNotificationCallbackInfo);
 
 #[allow(dead_code)]
 pub struct AppleLibraries {
@@ -73,6 +75,13 @@ pub struct AppleLibraries {
 
     // MobileDevice functions
     pub am_device_create_from_properties: unsafe extern "C" fn(CFDictionaryRef) -> AMDeviceRef,
+    pub am_device_notification_subscribe_legacy: unsafe extern "C" fn(
+        AMDeviceLegacyNotificationCallback,
+        u32,
+        u32,
+        u32,
+        *mut AMDeviceNotificationRef,
+    ) -> i32,
     pub am_device_notification_subscribe: unsafe extern "C" fn(
         AMDeviceNotificationCallback,
         i32,
@@ -199,6 +208,7 @@ pub fn get_apple_libraries() -> Result<Arc<AppleLibraries>> {
         let cf_run_loop_stop = load_sym!(cf_lib, "CFRunLoopStop");
 
         let am_device_create_from_properties = load_sym!(md_lib, "AMDeviceCreateFromProperties");
+        let am_device_notification_subscribe_legacy = load_sym!(md_lib, "AMDeviceNotificationSubscribe");
         let am_device_notification_subscribe = load_sym!(md_lib, "AMDeviceNotificationSubscribeWithOptions");
         let am_device_notification_unsubscribe = load_sym!(md_lib, "AMDeviceNotificationUnsubscribe");
         let am_device_copy_device_identifier = load_sym!(md_lib, "AMDeviceCopyDeviceIdentifier");
@@ -269,6 +279,7 @@ pub fn get_apple_libraries() -> Result<Arc<AppleLibraries>> {
             cf_run_loop_stop,
 
             am_device_create_from_properties,
+            am_device_notification_subscribe_legacy,
             am_device_notification_subscribe,
             am_device_notification_unsubscribe,
             am_device_copy_device_identifier,
